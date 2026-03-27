@@ -273,6 +273,10 @@ td{padding:7px 10px;font-size:12px;border-right:1px solid var(--border);vertical
       <option value="claude-opus-4-6">claude-opus-4-6 · Highest quality</option>
     </select>
     <div class="s-sep"></div>
+    <label class="s-label">GitHub Sync Token <span style="font-weight:400;color:var(--dim)">(for cross-device sync)</span></label>
+    <input type="password" class="s-input" id="s-gist" placeholder="ghp_... (GitHub PAT with gist scope)">
+    <div class="s-note">github.com/settings/tokens → Generate new token (classic) → tick only <b>gist</b><br>Enables watchlist sync across all your devices.</div>
+    <div class="s-sep"></div>
     <label class="s-label">Change Password</label>
     <input type="password" class="s-input" id="s-pw1" placeholder="New password">
     <input type="password" class="s-input" id="s-pw2" placeholder="Confirm" style="margin-top:8px">
@@ -369,42 +373,75 @@ td{padding:7px 10px;font-size:12px;border-right:1px solid var(--border);vertical
 // CONSTANTS & STATE
 // ═══════════════════════════════════
 const SK_WL='ierp-wl-v2', SK_AUTH='ierp-auth-v1', SK_SETTINGS='ierp-cfg-v1',
-      SK_SESSION='ierp-sess', SK_COLS='ierp-cols-v1', SK_FILTER='ierp-filter-v1';
+      SK_SESSION='ierp-sess', SK_COLS='ierp-cols-v1', SK_GIST_ID='ierp-gist-id';
 
-// Column definitions
-const COLS = [
-  {id:'ticker',  label:'Ticker',    group:'PRICE',     always:true},
-  {id:'company', label:'Company',   group:'PRICE'},
-  {id:'sector',  label:'Sector',    group:'PRICE'},
-  {id:'mcapCat', label:'Cap Size',  group:'PRICE'},
-  {id:'mcap',    label:'Mkt Cap',   group:'PRICE'},
-  {id:'cmp',     label:'CMP',       group:'PRICE'},
-  {id:'range52', label:'52W Range', group:'PRICE'},
-  {id:'pct52w',  label:'%↑52WLow', group:'PRICE'},
-  {id:'pe',      label:'P/E',       group:'VALUATION'},
-  {id:'ev',      label:'EV/EBITDA', group:'VALUATION'},
-  {id:'verdict', label:'Verdict',   group:'VALUATION'},
-  {id:'rsi',     label:'RSI',       group:'TECHNICAL'},
-  {id:'vs200',   label:'vs 200D',   group:'TECHNICAL'},
-  {id:'struct',  label:'Structure', group:'TECHNICAL'},
-  {id:'cagr1',   label:'CAGR 1Y',   group:'RETURN'},
-  {id:'cagr3',   label:'CAGR 3Y',   group:'RETURN'},
-  {id:'cagr5',   label:'CAGR 5Y',   group:'RETURN'},
-  {id:'entry',   label:'Entry Zone',group:'RETURN'},
-  {id:'constp',  label:'Cons TP',   group:'RETURN'},
-  {id:'signal',  label:'Signal',    group:'RETURN'},
-  {id:'updated', label:'Updated',   group:'ACTION'},
-];
-const DEFAULT_COLS = ['ticker','company','sector','mcapCat','mcap','cmp','range52','pct52w','pe','ev','verdict','rsi','vs200','struct','cagr1','cagr3','cagr5','entry','signal','updated'];
+// ═══════════════════════════════════
+// GITHUB GIST SYNC
+// Cloud storage for cross-device sync
+// Uses user's GitHub Personal Access Token (gist scope only)
+// ═══════════════════════════════════
+const GIST_FILE = 'ierp_data.json';
 
-let STATE = {
-  view:'watchlist', stocks:[], analysing:false,
-  visibleCols: null,  // loaded from storage
-  filter: { sectors:[], bhs:[], minCagr:null, verdicts:[], mcapCats:[] },
-  filterOpen: false, colsOpen: false,
-  drawerTicker: null,
-  hmSector: 'ALL',   // heatmap sector filter (for both CAGR and Sector views)
-};
+async function gistFindId(token) {
+  // Check cached ID first
+  const cached = ls.get(SK_GIST_ID);
+  if (cached) return cached;
+  // Search all gists for our file
+  const r = await fetch('https://api.github.com/gists?per_page=100', {
+    headers: { 'Authorization': `token ${token}`, 'Accept': 'application/vnd.github.v3+json' }
+  });
+  if (!r.ok) return null;
+  const gists = await r.json();
+  const found = gists.find(g => g.files && g.files[GIST_FILE]);
+  if (found) { ls.set(SK_GIST_ID, found.id); return found.id; }
+  return null;
+}
+
+async function gistLoad(token) {
+  const id = await gistFindId(token);
+  if (!id) return null;
+  const r = await fetch(`https://api.github.com/gists/${id}`, {
+    headers: { 'Authorization': `token ${token}`, 'Accept': 'application/vnd.github.v3+json' }
+  });
+  if (!r.ok) return null;
+  const data = await r.json();
+  const raw = data.files?.[GIST_FILE]?.content;
+  if (!raw) return null;
+  return JSON.parse(raw);
+}
+
+async function gistSave(token, payload) {
+  if (!token) return;
+  const content = JSON.stringify(payload);
+  let id = await gistFindId(token);
+  if (id) {
+    // Update existing gist
+    await fetch(`https://api.github.com/gists/${id}`, {
+      method: 'PATCH',
+      headers: { 'Authorization': `token ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ files: { [GIST_FILE]: { content } } })
+    });
+  } else {
+    // Create new private gist
+    const r = await fetch('https://api.github.com/gists', {
+      method: 'POST',
+      headers: { 'Authorization': `token ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ description: 'IERP Watchlist Sync', public: false, files: { [GIST_FILE]: { content } } })
+    });
+    if (r.ok) { const d = await r.json(); ls.set(SK_GIST_ID, d.id); }
+  }
+}
+
+// Save both locally and to Gist (fire-and-forget on Gist)
+async function saveAll() {
+  ls.set(SK_WL, STATE.stocks);
+  const cfg = ls.get(SK_SETTINGS) || {};
+  if (cfg.gistToken) {
+    const auth = ls.get(SK_AUTH);
+    gistSave(cfg.gistToken, { auth, watchlist: STATE.stocks, version: 1 })
+      .catch(e => console.warn('Gist sync failed:', e.message));
+  }
+}
 
 // ═══════════════════════════════════
 // STORAGE
@@ -438,20 +475,79 @@ function mcapBadge(cat) {
 }
 
 // ═══════════════════════════════════
+// COLUMNS & STATE
+// ═══════════════════════════════════
+const COLS = [
+  {id:'ticker',  label:'Ticker',    group:'PRICE',    always:true},
+  {id:'company', label:'Company',   group:'PRICE'},
+  {id:'sector',  label:'Sector',    group:'PRICE'},
+  {id:'mcapCat', label:'Cap Size',  group:'PRICE'},
+  {id:'mcap',    label:'Mkt Cap',   group:'PRICE'},
+  {id:'cmp',     label:'CMP',       group:'PRICE'},
+  {id:'range52', label:'52W Range', group:'PRICE'},
+  {id:'pct52w',  label:'%↑52WLow', group:'PRICE'},
+  {id:'pe',      label:'P/E',       group:'VALUATION'},
+  {id:'ev',      label:'EV/EBITDA', group:'VALUATION'},
+  {id:'verdict', label:'Verdict',   group:'VALUATION'},
+  {id:'rsi',     label:'RSI',       group:'TECHNICAL'},
+  {id:'vs200',   label:'vs 200D',   group:'TECHNICAL'},
+  {id:'struct',  label:'Structure', group:'TECHNICAL'},
+  {id:'cagr1',   label:'CAGR 1Y',   group:'RETURN'},
+  {id:'cagr3',   label:'CAGR 3Y',   group:'RETURN'},
+  {id:'cagr5',   label:'CAGR 5Y',   group:'RETURN'},
+  {id:'entry',   label:'Entry Zone',group:'RETURN'},
+  {id:'constp',  label:'Cons TP',   group:'RETURN'},
+  {id:'signal',  label:'Signal',    group:'RETURN'},
+  {id:'updated', label:'Updated',   group:'ACTION'},
+];
+const DEFAULT_COLS = ['ticker','company','sector','mcapCat','mcap','cmp','range52','pct52w','pe','ev','verdict','rsi','vs200','struct','cagr1','cagr3','cagr5','entry','signal','updated'];
+
+let STATE = {
+  view:'watchlist', stocks:[], analysing:false,
+  visibleCols: null,
+  filter: { sectors:[], bhs:[], minCagr:null, verdicts:[], mcapCats:[] },
+  filterOpen: false, colsOpen: false,
+  drawerTicker: null,
+  hmSector: 'ALL',
+};
+
+// ═══════════════════════════════════
 // AUTH
 // ═══════════════════════════════════
 async function sha256(s){
   const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));
   return Array.from(new Uint8Array(b)).map(x=>x.toString(16).padStart(2,'0')).join('');
 }
+
 async function initAuth(){
   const auth=ls.get(SK_AUTH), sess=sessionStorage.getItem(SK_SESSION);
-  if(sess&&auth){showApp();return;}
-  if(!auth)renderSetup();else renderLogin();
+  if(sess&&auth){ showApp(); return; }
+  if(auth) renderLogin();
+  else     renderNewDevice();  // no local data — could be new device or first run
 }
+
+// Called on first-ever launch OR new device
+function renderNewDevice(){
+  document.getElementById('auth-title').textContent = 'Welcome to IERP';
+  document.getElementById('auth-sub').textContent   = 'First time here, or on a new device?';
+  document.getElementById('auth-err').style.display = 'none';
+  document.getElementById('auth-fields').innerHTML = `
+    <button class="auth-btn" style="margin-bottom:12px" onclick="renderSetup()">
+      🆕 Create New Account
+    </button>
+    <button class="auth-btn" style="background:var(--surf3);border:1px solid var(--border);color:var(--text)" onclick="renderRestoreFromGist()">
+      🔄 Restore Existing Account
+    </button>
+    <div class="auth-note" style="margin-top:16px">
+      <b>New account:</b> First time using IERP — set up credentials and API key.<br><br>
+      <b>Restore account:</b> You've used IERP on another device with Gist Sync enabled — enter your sync token to restore your watchlist and login.
+    </div>`;
+}
+
 function renderSetup(){
-  document.getElementById('auth-title').textContent='Set Up Your Account';
-  document.getElementById('auth-sub').textContent='Create login credentials and enter your Anthropic API key';
+  document.getElementById('auth-title').textContent='Create Account';
+  document.getElementById('auth-sub').textContent='Set up your credentials and Anthropic API key';
+  document.getElementById('auth-err').style.display='none';
   document.getElementById('auth-fields').innerHTML=`
     <label class="auth-label">Username</label>
     <input class="auth-input" id="f-user" placeholder="Choose a username">
@@ -461,50 +557,125 @@ function renderSetup(){
     <div class="auth-sep"></div>
     <label class="auth-label">Anthropic API Key</label>
     <input class="auth-input" id="f-key" placeholder="sk-ant-...">
-    <div class="auth-note">🔑 Get your key at <b>console.anthropic.com</b><br>Stored only in this browser. Never shared.</div>
-    <button class="auth-btn" style="margin-top:18px" onclick="doSetup()">Create Account →</button>`;
+    <div class="auth-note">
+      🔑 Get your key at <b>console.anthropic.com</b><br>
+      Stored only in this browser. Never shared.
+    </div>
+    <div class="auth-sep"></div>
+    <label class="auth-label">GitHub Sync Token <span style="color:var(--dim);font-weight:400">(optional — enables cross-device sync)</span></label>
+    <input class="auth-input" id="f-gist" placeholder="ghp_... (GitHub PAT with gist scope)">
+    <div class="auth-note">
+      Optional: Go to <b>github.com/settings/tokens</b> → Generate new token (classic) → tick only <b>gist</b> → copy token here.<br>
+      This lets you sync your watchlist across devices.
+    </div>
+    <button class="auth-btn" style="margin-top:18px" onclick="doSetup()">Create Account →</button>
+    <span class="auth-link" onclick="renderNewDevice()">← Back</span>`;
 }
+
 function renderLogin(){
   const a=ls.get(SK_AUTH);
   document.getElementById('auth-title').textContent='Welcome Back';
-  document.getElementById('auth-sub').textContent=`Sign in as ${a.user}`;
+  document.getElementById('auth-sub').textContent=`Sign in as ${a?.user||''}`;
+  document.getElementById('auth-err').style.display='none';
   document.getElementById('auth-fields').innerHTML=`
     <label class="auth-label">Password</label>
     <input class="auth-input" type="password" id="f-pw" onkeydown="if(event.key==='Enter')doLogin()">
     <button class="auth-btn" onclick="doLogin()">Sign In →</button>
-    <span class="auth-link" onclick="resetAccount()">Reset account (clears all data)</span>`;
+    <span class="auth-link" onclick="renderNewDevice()">Different device / Restore account</span>
+    <span class="auth-link" onclick="resetAccount()" style="color:var(--dim)">Reset this device</span>`;
   setTimeout(()=>document.getElementById('f-pw')?.focus(),50);
 }
+
+function renderRestoreFromGist(){
+  document.getElementById('auth-title').textContent='Restore Account';
+  document.getElementById('auth-sub').textContent='Enter your GitHub Sync Token to restore';
+  document.getElementById('auth-err').style.display='none';
+  document.getElementById('auth-fields').innerHTML=`
+    <label class="auth-label">GitHub Sync Token</label>
+    <input class="auth-input" id="f-restore-token" placeholder="ghp_...">
+    <div class="auth-note">
+      This is the GitHub Personal Access Token (gist scope) you created when setting up IERP.<br>
+      Found at <b>github.com/settings/tokens</b>
+    </div>
+    <button class="auth-btn" style="margin-top:16px" id="f-restore-btn" onclick="doRestoreFromGist()">Restore →</button>
+    <span class="auth-link" onclick="renderNewDevice()">← Back</span>`;
+}
+
+async function doRestoreFromGist(){
+  const token = document.getElementById('f-restore-token')?.value.trim();
+  if(!token){showAuthErr('Enter your GitHub sync token');return;}
+  const btn = document.getElementById('f-restore-btn');
+  btn.textContent='Restoring…'; btn.disabled=true;
+  try {
+    const data = await gistLoad(token);
+    if(!data){showAuthErr('No IERP data found for this token. Check the token and retry.');btn.textContent='Restore →';btn.disabled=false;return;}
+    // Restore auth and watchlist to localStorage
+    ls.set(SK_AUTH, data.auth);
+    if(data.watchlist) ls.set(SK_WL, data.watchlist);
+    // Save gist token in settings
+    const cfg = ls.get(SK_SETTINGS)||{};
+    ls.set(SK_SETTINGS, {...cfg, gistToken: token});
+    // Now show login
+    renderLogin();
+  } catch(e) {
+    showAuthErr('Failed to restore: '+e.message);
+    btn.textContent='Restore →'; btn.disabled=false;
+  }
+}
+
 async function doSetup(){
   const u=document.getElementById('f-user').value.trim(),
         p1=document.getElementById('f-pw1').value,
         p2=document.getElementById('f-pw2').value,
-        k=document.getElementById('f-key').value.trim();
+        k=document.getElementById('f-key').value.trim(),
+        gist=document.getElementById('f-gist')?.value.trim()||'';
   if(!u){showAuthErr('Please enter a username');return;}
   if(p1.length<6){showAuthErr('Password must be at least 6 characters');return;}
   if(p1!==p2){showAuthErr('Passwords do not match');return;}
   if(!k||k.length<20){showAuthErr('Please enter your Anthropic API key');return;}
-  ls.set(SK_AUTH,{user:u,hash:await sha256(p1)});
-  ls.set(SK_SETTINGS,{apiKey:k,model:'claude-haiku-4-5-20251001'});
+  const hash=await sha256(p1);
+  const auth={user:u,hash};
+  ls.set(SK_AUTH,auth);
+  ls.set(SK_SETTINGS,{apiKey:k,model:'claude-haiku-4-5-20251001',gistToken:gist});
   sessionStorage.setItem(SK_SESSION,'1');
+  // If gist token provided, save auth to gist immediately
+  if(gist) {
+    try{ await gistSave(gist,{auth,watchlist:[],version:1}); }catch{}
+  }
   showApp();
 }
+
 async function doLogin(){
   const p=document.getElementById('f-pw')?.value;
   if(!p){showAuthErr('Enter your password');return;}
   const a=ls.get(SK_AUTH);
+  if(!a){showAuthErr('No account found on this device. Use "Restore account".');return;}
   if(await sha256(p)!==a.hash){showAuthErr('Incorrect password');return;}
   sessionStorage.setItem(SK_SESSION,'1');
   showApp();
 }
+
 function showAuthErr(m){const e=document.getElementById('auth-err');e.textContent=m;e.style.display='block';}
-function resetAccount(){if(!confirm('Delete all data?'))return;localStorage.clear();sessionStorage.clear();location.reload();}
+function resetAccount(){if(!confirm('Delete all local data on this device?'))return;localStorage.clear();sessionStorage.clear();location.reload();}
 function logout(){sessionStorage.clear();closeSettings();document.getElementById('app').style.display='none';document.getElementById('auth').style.display='flex';renderLogin();}
+
 function showApp(){
   document.getElementById('auth').style.display='none';
   document.getElementById('app').style.display='flex';
   STATE.stocks=ls.get(SK_WL)||[];
   STATE.visibleCols=ls.get(SK_COLS)||[...DEFAULT_COLS];
+  // Pull latest from Gist on login (sync down)
+  const cfg=ls.get(SK_SETTINGS)||{};
+  if(cfg.gistToken){
+    gistLoad(cfg.gistToken).then(data=>{
+      if(data?.watchlist?.length){
+        STATE.stocks=data.watchlist;
+        ls.set(SK_WL,STATE.stocks);
+        updateSidebar();
+        renderContent();
+      }
+    }).catch(()=>{});
+  }
   render();
 }
 
@@ -611,7 +782,7 @@ async function runMAOS(ticker, onStep){
   const tk=ticker.trim().toUpperCase();
   if(!/^[A-Z0-9&\-]{1,20}$/.test(tk))throw new Error(`"${tk}" invalid NSE ticker format.`);
   onStep('SA-1/2/3 — Market data, technicals, fundamentals',15);
-  const p1=`NSE ticker: ${tk}\nReturn this JSON with real values:\n{"name":"","sector":"BANKING","cmp":0,"hi52":0,"lo52":0,"mc":"","mcn":0,"pe":0,"pb":0,"ev":0,"fpe":0,"dy":0,"rsi":50,"d50":0,"d200":0,"str":"Uptrend","s1":0,"s2":0,"r1":0,"r2":0,"tech":"momentum narrative","roe":0,"roce":0,"de":0,"em":0,"rg":0,"fcf":"positive","k1n":"KPI1","k1v":"v","k1b":"b","k1s":"ABOVE","k2n":"KPI2","k2v":"v","k2b":"b","k2s":"AT"}\nsector=BANKING|IT|TELECOM|FMCG|PHARMA|AUTO|ENERGY|METALS|INFRA|NBFC|REALTY|OTHER. mcn=market cap in Crores as number (e.g. 150000). str=Uptrend|Downtrend|Coiling|Breakout|Distribution|Accumulation|Range. Return JSON only.`;
+  const p1=`NSE ticker: ${tk}\nReturn this JSON with real values:\n{"name":"","sector":"BANKING","cmp":0,"hi52":0,"lo52":0,"mc":"","mcn":0,"pe":0,"pb":0,"evr":0,"fpe":0,"dy":0,"rsi":50,"d50":0,"d200":0,"str":"Uptrend","s1":0,"s2":0,"r1":0,"r2":0,"tech":"momentum narrative","roe":0,"roce":0,"de":0,"em":0,"rg":0,"fcf":"positive","k1n":"KPI1","k1v":"v","k1b":"b","k1s":"ABOVE","k2n":"KPI2","k2v":"v","k2b":"b","k2s":"AT"}\nsector=BANKING|IT|TELECOM|FMCG|PHARMA|AUTO|ENERGY|METALS|INFRA|NBFC|REALTY|OTHER. mcn=market cap in Crores as plain number (e.g. 150000 means ₹1.5 lakh crore). evr=EV/EBITDA RATIO (e.g. 15.2 means 15.2 times) NOT absolute enterprise value. str=Uptrend|Downtrend|Coiling|Breakout|Distribution|Accumulation|Range. Return JSON only.`;
   const p2=`NSE ticker: ${tk}\nReturn this JSON with real values:\n{"mt":"moat","rank":"rank","pp":"pricing power","risks":["r1","r2","r3"],"ctp":0,"cr":"70% BUY","vv":"FAIRLY_VALUED","pe5y":0,"peg":0,"dcf":0,"rfc":0,"vn":"note","ec":0,"ea":0,"e1":0,"e3":0,"e5":0,"t1b":0,"t1m":0,"t1a":0,"t3b":0,"t3m":0,"t3a":0,"t5b":0,"t5m":0,"t5a":0,"bhs":"HOLD","st":"NEUTRAL","note":"narrative"}\nvv=UNDERVALUED|MARGINALLY_UNDERVALUED|FAIRLY_VALUED|MARGINALLY_OVERVALUED|OVERVALUED. bhs=BUY|HOLD|SELL. st=OPPORTUNITY|WATCH|NEUTRAL|CAUTION|RISK. All target prices >0. Return JSON only.`;
   const [r1,r2]=await Promise.all([apiCall(p1,SYS),apiCall(p2,SYS)]);
   if(!r1.name&&!r1.cmp)throw new Error(`"${tk}" not recognised.\nUse exact NSE symbol: RELIANCE · HDFCBANK · TCS · BHARTIARTL · INFY\nWIPRO · ICICIBANK · BAJFINANCE · KOTAKBANK · TATAMOTORS\nIf correct, retry — model occasionally needs a second attempt.`);
@@ -626,7 +797,7 @@ async function runMAOS(ticker, onStep){
     analysisDate:new Date().toISOString(),
     cmp:r1.cmp, week52High:r1.hi52, week52Low:r1.lo52, marketCap:r1.mc,
     mcapNum, mcapCat:mcapCategory(mcapNum),
-    pe:r1.pe, pb:r1.pb, evEbitda:r1.ev, fwdPe:r1.fpe, divYield:r1.dy,
+    pe:r1.pe, pb:r1.pb, evEbitda:r1.evr, fwdPe:r1.fpe, divYield:r1.dy,
     pct52wLow:r1.lo52?+(((r1.cmp-r1.lo52)/r1.lo52*100).toFixed(1)):null,
     rsi:r1.rsi, dma50:r1.d50, dma200:r1.d200, priceStructure:r1.str,
     support1:r1.s1, support2:r1.s2, resistance1:r1.r1, resistance2:r1.r2,
@@ -784,7 +955,7 @@ async function doAnalyse(tk){
   try{
     const rec=await runMAOS(tk,(step,pct)=>setProgress(step,pct));
     STATE.stocks=[rec,...STATE.stocks.filter(s=>s.ticker!==rec.ticker)];
-    ls.set(SK_WL,STATE.stocks);
+    await saveAll();
     setView('watchlist');
   }catch(e){showError(e.message);}
   STATE.analysing=false;
@@ -796,7 +967,7 @@ async function doAnalyse(tk){
 function removeStock(ticker){
   if(!confirm(`Remove ${ticker} from watchlist?`))return;
   STATE.stocks=STATE.stocks.filter(s=>s.ticker!==ticker);
-  ls.set(SK_WL,STATE.stocks);
+  saveAll();
   if(STATE.drawerTicker===ticker)closeDrawer();
   updateSidebar();
   renderContent();
@@ -1116,9 +1287,9 @@ function renderBHS(){
 // ═══════════════════════════════════
 function openDrawer(ticker){
   STATE.drawerTicker=ticker;
-  renderDrawer();
   document.getElementById('drawer-overlay').style.display='block';
   document.getElementById('drawer').classList.add('open');
+  renderDrawer();
 }
 function closeDrawer(){
   document.getElementById('drawer').classList.remove('open');
@@ -1126,22 +1297,30 @@ function closeDrawer(){
   STATE.drawerTicker=null;
 }
 function navDrawer(dir){
-  const list=applyFilters(STATE.stocks);
+  // Navigate through full watchlist (not filtered) so nav always works
+  const list=STATE.stocks;
   const idx=list.findIndex(s=>s.ticker===STATE.drawerTicker);
-  const next=list[idx+dir];
-  if(next){STATE.drawerTicker=next.ticker;renderDrawer();}
+  if(idx===-1) return;
+  const nextIdx=idx+dir;
+  if(nextIdx>=0&&nextIdx<list.length){
+    STATE.drawerTicker=list[nextIdx].ticker;
+    renderDrawer();
+  }
 }
 function renderDrawer(){
   const s=STATE.stocks.find(x=>x.ticker===STATE.drawerTicker);
-  if(!s)return;
-  const list=applyFilters(STATE.stocks);
+  if(!s) return;
+  // Navigate through full list so prev/next always available
+  const list=STATE.stocks;
   const idx=list.findIndex(x=>x.ticker===s.ticker);
   const vs200=(s.cmp&&s.dma200)?+((s.cmp-s.dma200)/s.dma200*100).toFixed(1):null;
   const tpUp=(s.consensusTP&&s.cmp)?+((s.consensusTP-s.cmp)/s.cmp*100).toFixed(1):null;
 
-  // Nav
-  document.getElementById('d-prev').disabled=idx<=0;
-  document.getElementById('d-next').disabled=idx>=list.length-1;
+  // Nav buttons
+  const prevBtn=document.getElementById('d-prev');
+  const nextBtn=document.getElementById('d-next');
+  if(prevBtn) prevBtn.disabled=(idx<=0);
+  if(nextBtn) nextBtn.disabled=(idx>=list.length-1);
   document.getElementById('d-nav-info').textContent=` ${idx+1} / ${list.length}`;
   document.getElementById('d-tk').textContent=s.ticker;
   document.getElementById('d-bhs-badge').innerHTML=bhsBadge(s.bhs);
